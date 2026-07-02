@@ -1,8 +1,12 @@
 # Platform stack (your custom build). CVAT runs as a SEPARATE compose stack
 # on the same VM — see the architecture doc, section 2.3.
 #
-# SETUP: Copy .env.example → .env and fill in your secrets before running.
-#        docker compose up --build
+# SETUP:
+#   git clone https://github.com/karan27-dev/Annoting_Backend
+#   cd Annoting_Backend
+#   git clone https://github.com/karan27-dev/Annoting_Frontend frontend
+#   cp .env.example .env   # then fill in your secrets
+#   docker compose up --build
 services:
   platform_db:
     image: postgres:16-alpine
@@ -26,7 +30,7 @@ services:
       - "6379:6379"
 
   platform_api:
-    build: ./backend
+    build: .          # backend root = this repo's root
     env_file: .env                 # copy .env.example → .env and fill secrets
     environment:
       # These override whatever is in .env so the app connects to sibling containers
@@ -39,7 +43,7 @@ services:
       - "8000:8000"
 
   platform_frontend:
-    build: ./frontend
+    build: ./frontend  # clone Annoting_Frontend into a 'frontend/' subfolder
     environment:
       # NEXT_PUBLIC_* vars are baked in at BUILD time in Next.js.
       # Since the browser calls this URL, it must be reachable from the user's
