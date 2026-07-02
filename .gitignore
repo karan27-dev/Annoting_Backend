@@ -1,0 +1,34 @@
+# Secrets & environment
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Database files
+*.db
+*.sqlite3
+
+# Logs
+*.log
+.cache/
+
+# Editors
+.vscode/
+.idea/
+.DS_Store
+
+# Docker
+*.override.yml

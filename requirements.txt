@@ -1,0 +1,22 @@
+# Core — unpinned upper bounds so pip can pick wheels for your Python version
+# (tested on 3.11–3.14). For reproducible prod builds, pin these once deployed.
+fastapi>=0.111
+uvicorn[standard]>=0.30
+sqlalchemy[asyncio]>=2.0.31
+aiosqlite>=0.20            # dev database driver (zero-setup SQLite)
+pydantic>=2.9
+pydantic-settings>=2.4
+python-jose[cryptography]>=3.3
+bcrypt>=4.1
+python-multipart>=0.0.9
+httpx>=0.27
+email-validator>=2.2
+pillow>=10                 # dataset intake: sample-image complexity estimation
+
+# ── Production / optional integrations ───────────────────────────────────────
+# Install these when you wire up the matching service:
+#   asyncpg>=0.30          # Postgres driver (needed only when DATABASE_URL=postgresql+asyncpg://...)
+#   boto3>=1.34            # Cloudflare R2 (S3-compatible)
+#   resend>=2.1            # Transactional email
+#   razorpay>=1.4          # Payments (coming soon)
+#   redis>=5.0             # Token blocklist / rate limit / queues
