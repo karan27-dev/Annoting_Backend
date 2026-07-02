@@ -1,0 +1,54 @@
+# Platform stack (your custom build). CVAT runs as a SEPARATE compose stack
+# on the same VM — see the architecture doc, section 2.3.
+#
+# SETUP: Copy .env.example → .env and fill in your secrets before running.
+#        docker compose up --build
+services:
+  platform_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: annoting
+      POSTGRES_PASSWORD: annoting
+      POSTGRES_DB: annoting
+    volumes:
+      - platform_db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U annoting"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  platform_redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  platform_api:
+    build: ./backend
+    env_file: .env                 # copy .env.example → .env and fill secrets
+    environment:
+      # These override whatever is in .env so the app connects to sibling containers
+      DATABASE_URL: postgresql+asyncpg://annoting:annoting@platform_db:5432/annoting
+      REDIS_URL: redis://platform_redis:6379/0
+    depends_on:
+      platform_db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  platform_frontend:
+    build: ./frontend
+    environment:
+      # NEXT_PUBLIC_* vars are baked in at BUILD time in Next.js.
+      # Since the browser calls this URL, it must be reachable from the user's
+      # machine (localhost), not from inside the Docker network.
+      NEXT_PUBLIC_API_URL: http://localhost:8000/v1
+    depends_on:
+      - platform_api
+    ports:
+      - "3000:3000"
+
+volumes:
+  platform_db_data:
