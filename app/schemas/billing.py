@@ -33,6 +33,7 @@ class QuoteResponse(BaseModel):
 class InvoiceOut(BaseModel):
     id: str
     invoice_number: str
+    project_id: str
     amount_inr: float
     gst_amount_inr: float
     total_inr: float

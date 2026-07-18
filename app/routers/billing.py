@@ -50,15 +50,17 @@ async def create_invoice(
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Actual labels delivered × the rate the client accepted in their quote.
-    actual_labels = (
+    # Don't double-bill a project.
+    existing = (
         await db.execute(
-            select(func.coalesce(func.sum(TaskAssignment.labels_count), 0)).where(
-                TaskAssignment.project_id == project.id,
-                TaskAssignment.status == AssignmentStatus.approved.value,
-            )
+            select(Invoice).where(Invoice.project_id == project.id)
         )
-    ).scalar() or 0
+    ).scalars().first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"This project already has invoice {existing.invoice_number}.",
+        )
 
     quote = (
         await db.execute(
@@ -70,14 +72,34 @@ async def create_invoice(
             .order_by(ProjectQuote.accepted_at.desc())
         )
     ).scalars().first()
-    rate = float(quote.rate_per_label_inr) if quote else 5.0
+    if not quote:
+        raise HTTPException(
+            status_code=400,
+            detail="No accepted quote — the client must accept the quote first.",
+        )
 
-    amount = round(float(actual_labels) * rate, 2)
+    rate = float(quote.rate_per_label_inr)
+
+    # Labels the reviewer actually approved so far.
+    actual_labels = (
+        await db.execute(
+            select(func.coalesce(func.sum(TaskAssignment.labels_count), 0)).where(
+                TaskAssignment.project_id == project.id,
+                TaskAssignment.status == AssignmentStatus.approved.value,
+            )
+        )
+    ).scalar() or 0
+
+    # Bill the price the client agreed to (the accepted quote). Once real work
+    # is approved and exceeds the estimate, bill the delivered labels instead so
+    # dense datasets are charged fairly.
+    delivered_amount = round(float(actual_labels) * rate, 2)
+    quoted_amount = float(quote.quoted_total_inr)
+    amount = max(quoted_amount, delivered_amount)
     gst, total = gst_breakdown(amount)
 
-    if quote:
-        quote.actual_labels = int(actual_labels)
-        quote.final_total_inr = amount
+    quote.actual_labels = int(actual_labels)
+    quote.final_total_inr = amount
 
     count = (await db.execute(select(func.count(Invoice.id)))).scalar() or 0
     number = f"SYL-{utcnow().year}-{count + 1:04d}"
@@ -97,6 +119,55 @@ async def create_invoice(
     await db.commit()
     await db.refresh(invoice)
     return invoice
+
+
+@router.get("/billing/invoiceable")
+async def invoiceable_projects(
+    _: User = Depends(require_roles(Role.super_admin, Role.ops_manager)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Projects the client has accepted a quote for that don't yet have an
+    invoice — the admin generates the invoice from here."""
+    from app.models.user import Client
+
+    invoiced = {
+        row[0]
+        for row in (
+            await db.execute(select(Invoice.project_id))
+        ).all()
+    }
+
+    rows = (
+        await db.execute(
+            select(Project, ProjectQuote, Client)
+            .join(
+                ProjectQuote,
+                (ProjectQuote.project_id == Project.id)
+                & (ProjectQuote.accepted_at.is_not(None)),
+            )
+            .join(Client, Client.id == Project.client_id, isouter=True)
+            .order_by(Project.created_at.desc())
+        )
+    ).all()
+
+    out = []
+    seen: set[str] = set()
+    for project, quote, client in rows:
+        if project.id in invoiced or project.id in seen:
+            continue
+        seen.add(project.id)
+        out.append(
+            {
+                "project_id": project.id,
+                "project_name": project.name,
+                "client_company": client.company_name if client else None,
+                "status": project.status,
+                "quoted_total_inr": float(quote.quoted_total_inr),
+                "estimated_labels": quote.estimated_labels,
+                "rate_per_label_inr": float(quote.rate_per_label_inr),
+            }
+        )
+    return out
 
 
 @router.get("/billing/invoices/{invoice_id}/pdf")

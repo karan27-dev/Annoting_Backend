@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+import secrets
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.deps import get_current_user
+from app.models.assignment import AssignmentStatus, TaskAssignment
 from app.models.billing import ProjectQuote
 from app.models.common import utcnow
 from app.models.project import IntakeStatus, Project, ProjectStatus
@@ -29,6 +32,14 @@ async def _client_for(user: User, db: AsyncSession) -> Client:
         await db.execute(select(Client).where(Client.user_id == user.id))
     ).scalar_one_or_none()
     if not client:
+        # Self-heal: a client-role user without a profile row (e.g. created
+        # before profiles existed) gets one on first use instead of a 403.
+        if user.role == Role.client.value:
+            client = Client(user_id=user.id, company_name=user.full_name)
+            db.add(client)
+            await db.commit()
+            await db.refresh(client)
+            return client
         raise HTTPException(status_code=403, detail="No client profile for this user")
     return client
 
@@ -67,6 +78,7 @@ async def create_project(
         media_type=body.media_type.value,
         data_source=body.data_source.value,
         delivery_format=body.delivery_format.value,
+        mode=body.mode.value,
     )
     db.add(project)
     client.total_projects += 1
@@ -142,15 +154,46 @@ async def project_intake(
     )
 
 
+async def _activate_for_annotation(project: Project, db: AsyncSession) -> None:
+    """Make an accepted project immediately visible on the annotator dashboard.
+
+    The whole dataset is ONE job (never split). If CVAT ingestion hasn't run
+    yet we create a placeholder full-container assignment so annotators see the
+    work right away; real CVAT ingestion later replaces the placeholder (its
+    cleanup removes assignments with cvat_job_id >= 900_000)."""
+    project.status = ProjectStatus.active.value
+
+    existing = (
+        await db.execute(
+            select(func.count(TaskAssignment.id)).where(
+                TaskAssignment.project_id == project.id
+            )
+        )
+    ).scalar() or 0
+    if existing == 0:
+        # Placeholder full-container job — one job, all frames.
+        placeholder_id = 900_000 + secrets.randbelow(90_000_000)
+        db.add(
+            TaskAssignment(
+                project_id=project.id,
+                cvat_job_id=placeholder_id,
+                cvat_task_id=placeholder_id,
+                frame_count=project.total_images or project.image_count or 0,
+                status=AssignmentStatus.assigned.value,
+            )
+        )
+
+
 @router.post("/{project_id}/quote/accept", response_model=MessageResponse)
 async def accept_quote(
     project_id: str,
+    background: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Client accepts the auto-generated quote — the project is now cleared
-    for annotation. The final invoice is based on actual approved labels at
-    this quoted rate."""
+    """Client accepts the quote — the project goes live for annotation
+    immediately (full dataset as one job), and we kick off CVAT ingestion in
+    the background to wire up the real labeling canvas."""
     p = await _owned_project(project_id, user, db)
     quote = await _latest_quote(project_id, db)
     if not quote or quote.published_at is None:
@@ -161,8 +204,16 @@ async def accept_quote(
     if quote.accepted_at is None:
         quote.accepted_at = utcnow()
         p.intake_status = IntakeStatus.quote_accepted.value
+        await _activate_for_annotation(p, db)
         await db.commit()
-    return MessageResponse(message="Quote accepted — annotation will begin shortly.")
+        # Best-effort: push data into CVAT and mirror real jobs. If CVAT is
+        # down the placeholder job stays visible until an admin re-runs setup.
+        from app.services.ingestion import run_ingestion_bg
+
+        background.add_task(run_ingestion_bg, project_id)
+    return MessageResponse(
+        message="Quote accepted — your project is now live for annotation."
+    )
 
 
 @router.get("/{project_id}/progress", response_model=ProgressOut)

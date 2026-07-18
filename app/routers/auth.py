@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import secrets
+
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import settings
 from app.core.security import (
     create_purpose_token,
     create_token,
@@ -17,6 +21,7 @@ from app.models.common import utcnow
 from app.models.user import Client, Role, User
 from app.schemas.auth import (
     ForgotPasswordRequest,
+    GoogleAuthRequest,
     LoginRequest,
     RefreshRequest,
     RegisterRequest,
@@ -29,6 +34,58 @@ from app.schemas.misc import MessageResponse
 from app.services.email_service import email_service
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+@router.post("/google", response_model=TokenResponse)
+async def google_auth(body: GoogleAuthRequest, db: AsyncSession = Depends(get_db)):
+    """Sign in / sign up with a Google ID token. Verifies the token with Google,
+    then creates the client account on first use (no password needed)."""
+    if not settings.google_oauth_client_id:
+        raise HTTPException(
+            status_code=503,
+            detail="Google sign-in isn't configured on the server yet.",
+        )
+
+    # Verify the ID token directly with Google (no client secret needed).
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.get(
+            "https://oauth2.googleapis.com/tokeninfo",
+            params={"id_token": body.credential},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    info = r.json()
+
+    if info.get("aud") != settings.google_oauth_client_id:
+        raise HTTPException(status_code=401, detail="Google token audience mismatch")
+    email = info.get("email")
+    if not email or str(info.get("email_verified")).lower() != "true":
+        raise HTTPException(status_code=401, detail="Google email not verified")
+
+    name = info.get("name") or email.split("@")[0]
+
+    user = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if not user:
+        # Random password — the account is only reachable via Google.
+        user = User(
+            email=email,
+            password_hash=hash_password(secrets.token_urlsafe(24)),
+            full_name=name,
+            role=Role.client.value,
+            is_verified=True,
+        )
+        db.add(user)
+        await db.flush()
+        db.add(Client(user_id=user.id, company_name=name))
+    user.last_login_at = utcnow()
+    await db.commit()
+
+    return TokenResponse(
+        access_token=create_token(user.id, user.role, "access"),
+        refresh_token=create_token(user.id, user.role, "refresh"),
+    )
 
 
 @router.post("/register", response_model=MessageResponse, status_code=201)

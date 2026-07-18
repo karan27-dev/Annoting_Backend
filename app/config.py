@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     # clients share via "anyone with the link".
     google_api_key: str = ""
 
+    # ── Google Sign-In (OAuth) ────────────────────────────────────────────────
+    # OAuth 2.0 Web client ID from Google Cloud Console. The same value must be
+    # exposed to the frontend as NEXT_PUBLIC_GOOGLE_CLIENT_ID. Enables the
+    # "Continue with Google" button; no client secret needed (ID-token flow).
+    google_oauth_client_id: str = ""
+
     # ── Resend (email) ────────────────────────────────────────────────────────
     resend_api_key: str = ""
     resend_from_email: str = "noreply@annoting.com"

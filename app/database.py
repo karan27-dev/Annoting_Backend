@@ -59,6 +59,7 @@ _ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     ("projects", "complexity_tier", "VARCHAR(10)"),
     ("projects", "intake_status", "VARCHAR(20) DEFAULT 'awaiting_data'"),
     ("projects", "intake_detail", "TEXT"),
+    ("projects", "mode", "VARCHAR(12) DEFAULT 'managed'"),
     # Admin-reviewed quotes: drafts until published.
     ("project_quotes", "published_at", "TIMESTAMP"),
     ("project_quotes", "admin_notes", "VARCHAR(500)"),

@@ -16,6 +16,7 @@ from app.schemas.misc import AnnotatorStatusUpdate, MessageResponse
 from app.schemas.project import CvatSetupRequest, ProjectOut, QuotePublishRequest
 from app.services.cvat_client import CvatNotConfigured, cvat
 from app.services.ingestion import IngestionError, ingest_project
+from app.services.quote_review import list_pending_quotes, publish_project_quote
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -148,58 +149,10 @@ async def export_project(
 async def pending_quotes(
     _: User = Depends(ADMIN), db: AsyncSession = Depends(get_db)
 ):
-    """Projects whose draft quote awaits review — the admin checks the counted
-    dataset, adjusts density/rate if the auto-estimate is off (e.g. 60 objects
-    in one image), and publishes the quote to the client."""
-    from app.models.billing import ProjectQuote
-    from app.models.project import IntakeStatus
-    from app.models.user import Client
-
-    rows = (
-        await db.execute(
-            select(Project, Client)
-            .join(Client, Client.id == Project.client_id, isouter=True)
-            .where(Project.intake_status == IntakeStatus.pending_review.value)
-            .order_by(Project.created_at.desc())
-        )
-    ).all()
-
-    out = []
-    for project, client in rows:
-        quote = (
-            await db.execute(
-                select(ProjectQuote)
-                .where(ProjectQuote.project_id == project.id)
-                .order_by(ProjectQuote.created_at.desc())
-            )
-        ).scalars().first()
-        out.append(
-            {
-                "project_id": project.id,
-                "project_name": project.name,
-                "client_company": client.company_name if client else None,
-                "annotation_type": project.annotation_type,
-                "image_count": project.image_count,
-                "video_count": project.video_count,
-                "total_files": project.total_images,
-                "complexity_tier": project.complexity_tier,
-                "estimated_objects_per_image": (
-                    float(project.estimated_objects_per_image)
-                    if project.estimated_objects_per_image is not None
-                    else None
-                ),
-                "turnaround_days": project.turnaround_days,
-                "delivery_format": project.delivery_format,
-                "suggested": {
-                    "rate_per_label_inr": float(quote.rate_per_label_inr),
-                    "estimated_labels": quote.estimated_labels,
-                    "quoted_total_inr": float(quote.quoted_total_inr),
-                }
-                if quote
-                else None,
-            }
-        )
-    return out
+    """Projects whose draft quote awaits review — check the counted dataset,
+    adjust density/rate if the auto-estimate is off (e.g. 60 objects in one
+    image), and publish the quote to the client."""
+    return await list_pending_quotes(db)
 
 
 @router.post("/projects/{project_id}/quote/publish")
@@ -209,83 +162,13 @@ async def publish_quote(
     _: User = Depends(ADMIN),
     db: AsyncSession = Depends(get_db),
 ):
-    """Admin sets the final density/rate after eyeballing the dataset, then the
-    quote goes live for the client to accept."""
-    from app.models.billing import ProjectQuote
-    from app.models.project import IntakeStatus
-    from app.models.user import Client
-    from app.services.email_service import email_service
-    from app.services.pricing_engine import calculate_quote_custom
-
-    project = await db.get(Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found")
-    if not project.total_images:
-        raise HTTPException(status_code=400, detail="No counted data to quote")
-
-    avg = body.avg_objects_per_image or float(
-        project.estimated_objects_per_image or 1
+    return await publish_project_quote(
+        db,
+        project_id,
+        body.avg_objects_per_image,
+        body.rate_per_label_inr,
+        body.notes,
     )
-    result = calculate_quote_custom(
-        project.annotation_type,
-        project.total_images,
-        avg,
-        project.turnaround_days or 14,
-        rate_override=body.rate_per_label_inr,
-    )
-
-    quote = (
-        await db.execute(
-            select(ProjectQuote)
-            .where(ProjectQuote.project_id == project.id)
-            .order_by(ProjectQuote.created_at.desc())
-        )
-    ).scalars().first()
-    if not quote:
-        quote = ProjectQuote(
-            project_id=project.id, annotation_type=project.annotation_type
-        )
-        db.add(quote)
-    if quote.accepted_at is not None:
-        raise HTTPException(status_code=400, detail="Quote already accepted")
-
-    quote.rate_per_label_inr = result.rate_per_label_inr
-    quote.estimated_labels = result.estimated_labels
-    quote.quoted_total_inr = result.estimated_total_inr
-    quote.turnaround_premium_pct = result.turnaround_premium_pct
-    quote.volume_discount_pct = result.volume_discount_pct
-    quote.admin_notes = body.notes
-    quote.published_at = utcnow()
-
-    project.estimated_objects_per_image = avg
-    project.intake_status = IntakeStatus.quoted.value
-    project.intake_detail = (
-        f"Quote ready — {result.estimated_labels} labels at "
-        f"₹{result.rate_per_label_inr}/label."
-    )
-    await db.commit()
-
-    # Tell the client their reviewed quote is live (best-effort).
-    try:
-        client = await db.get(Client, project.client_id)
-        user = await db.get(User, client.user_id) if client else None
-        if user:
-            email_service.send(
-                user.email,
-                f"Your quote for “{project.name}” is ready",
-                f"<p>Our team reviewed your dataset ({project.total_images} files) "
-                f"and published your quote: <b>₹{result.estimated_total_inr}</b>. "
-                f"Accept it on your dashboard to start annotation.</p>",
-            )
-    except Exception:  # noqa: BLE001
-        pass
-
-    return {
-        "message": "Quote published to client",
-        "quoted_total_inr": result.estimated_total_inr,
-        "estimated_labels": result.estimated_labels,
-        "rate_per_label_inr": result.rate_per_label_inr,
-    }
 
 
 @router.get("/annotators")
@@ -334,20 +217,40 @@ async def set_annotator_status(
 
 @router.get("/dashboard")
 async def dashboard(_: User = Depends(ADMIN), db: AsyncSession = Depends(get_db)):
-    active = (
-        await db.execute(
-            select(func.count(Project.id)).where(
-                Project.status == ProjectStatus.active.value
-            )
-        )
-    ).scalar() or 0
-    pending = (
-        await db.execute(
-            select(func.count(Project.id)).where(
-                Project.status == ProjectStatus.pending_setup.value
-            )
-        )
-    ).scalar() or 0
+    """Operations command center — everything real, nothing hardcoded."""
+    from app.models.assignment import AssignmentStatus
+    from app.models.billing import Invoice, InvoiceStatus
+    from app.models.project import IntakeStatus
+
+    # ── Pipeline funnel: every project bucketed into one operational stage ────
+    projects = (await db.execute(select(Project))).scalars().all()
+    funnel = {
+        "awaiting_data": 0,
+        "counting": 0,
+        "pending_quote": 0,
+        "quoted": 0,
+        "in_annotation": 0,
+        "in_review": 0,
+        "delivered": 0,
+    }
+    for p in projects:
+        if p.status == ProjectStatus.delivered.value:
+            funnel["delivered"] += 1
+        elif p.status == ProjectStatus.review.value:
+            funnel["in_review"] += 1
+        elif p.status == ProjectStatus.active.value:
+            funnel["in_annotation"] += 1
+        elif p.intake_status == IntakeStatus.pending_review.value:
+            funnel["pending_quote"] += 1
+        elif p.intake_status == IntakeStatus.quoted.value:
+            funnel["quoted"] += 1
+        elif p.intake_status == IntakeStatus.quote_accepted.value:
+            funnel["in_annotation"] += 1
+        elif p.intake_status == IntakeStatus.counting.value:
+            funnel["counting"] += 1
+        else:
+            funnel["awaiting_data"] += 1
+
     annotators = (
         await db.execute(
             select(func.count(AnnotatorProfile.id)).where(
@@ -356,20 +259,62 @@ async def dashboard(_: User = Depends(ADMIN), db: AsyncSession = Depends(get_db)
         )
     ).scalar() or 0
 
-    today = utcnow() - timedelta(days=1)
-    labels_today = (
+    # ── Review queue depth (jobs waiting on a reviewer) ──────────────────────
+    review_pending = (
         await db.execute(
-            select(func.coalesce(func.sum(TaskAssignment.labels_count), 0)).where(
-                TaskAssignment.completed_at.is_not(None),
-                TaskAssignment.completed_at >= today,
+            select(func.count(TaskAssignment.id)).where(
+                TaskAssignment.status == AssignmentStatus.review_pending.value
             )
         )
     ).scalar() or 0
 
+    # ── Labels delivered per day, last 14 days (real submissions) ────────────
+    assignments = (await db.execute(select(TaskAssignment))).scalars().all()
+    now = utcnow()
+    series: list[int] = []
+    for i in range(13, -1, -1):
+        day_start = (now - timedelta(days=i)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        day_end = day_start + timedelta(days=1)
+        count = 0
+        for a in assignments:
+            ts = a.completed_at
+            if ts is None:
+                continue
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=now.tzinfo)
+            if day_start <= ts < day_end:
+                count += a.labels_count or 0
+        series.append(count)
+    labels_today = series[-1]
+
+    # ── Revenue: this month's issued invoices + outstanding balance ──────────
+    month_start = now.replace(
+        day=1, hour=0, minute=0, second=0, microsecond=0
+    )
+    invoices = (await db.execute(select(Invoice))).scalars().all()
+    revenue_mtd = 0.0
+    outstanding = 0.0
+    for inv in invoices:
+        issued = inv.issued_at
+        if issued is not None:
+            if issued.tzinfo is None:
+                issued = issued.replace(tzinfo=now.tzinfo)
+            if issued >= month_start:
+                revenue_mtd += float(inv.total_inr)
+        if inv.status != InvoiceStatus.paid.value:
+            outstanding += float(inv.total_inr)
+
     return {
-        "active_projects": int(active),
+        "active_projects": funnel["in_annotation"],
         "annotators_online": int(annotators),
         "labels_today": int(labels_today),
-        "revenue_mtd_inr": 0,
-        "pending_setup": int(pending),
+        "revenue_mtd_inr": round(revenue_mtd, 2),
+        "outstanding_inr": round(outstanding, 2),
+        "pending_setup": funnel["awaiting_data"] + funnel["counting"],
+        "pending_quotes": funnel["pending_quote"],
+        "review_queue": int(review_pending),
+        "funnel": funnel,
+        "labels_series_14d": series,
     }

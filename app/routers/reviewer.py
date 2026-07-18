@@ -18,6 +18,7 @@ from app.models.common import hours_since, utcnow
 from app.models.project import Project
 from app.models.user import AnnotatorProfile, Role, User
 from app.schemas.misc import MessageResponse, ReviewActionRequest
+from app.schemas.project import QuotePublishRequest
 from app.services.cvat_client import cvat
 
 router = APIRouter(prefix="/reviewer", tags=["reviewer"])
@@ -298,6 +299,35 @@ async def reject(
 ):
     await _act(assignment_id, reviewer, ReviewAction.rejected, body.notes, db)
     return MessageResponse(message="Rejected and reassigned")
+
+
+@router.get("/quotes/pending")
+async def reviewer_pending_quotes(
+    _: User = Depends(require_roles(Role.reviewer)),
+    db: AsyncSession = Depends(get_db),
+):
+    """Reviewers can also price counted datasets — same queue as admin."""
+    from app.services.quote_review import list_pending_quotes
+
+    return await list_pending_quotes(db)
+
+
+@router.post("/projects/{project_id}/quote/publish")
+async def reviewer_publish_quote(
+    project_id: str,
+    body: QuotePublishRequest,
+    _: User = Depends(require_roles(Role.reviewer)),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.services.quote_review import publish_project_quote
+
+    return await publish_project_quote(
+        db,
+        project_id,
+        body.avg_objects_per_image,
+        body.rate_per_label_inr,
+        body.notes,
+    )
 
 
 @router.get("/annotator-scorecards")

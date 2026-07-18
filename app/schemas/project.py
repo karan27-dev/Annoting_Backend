@@ -9,6 +9,7 @@ from app.models.project import (
     DataSource,
     DeliveryFormat,
     MediaType,
+    ProjectMode,
 )
 
 
@@ -28,6 +29,7 @@ class ProjectCreate(BaseModel):
     media_type: MediaType = MediaType.images
     data_source: DataSource = DataSource.upload
     delivery_format: DeliveryFormat = DeliveryFormat.coco
+    mode: ProjectMode = ProjectMode.managed
 
 
 class ProjectOut(BaseModel):
@@ -53,6 +55,7 @@ class ProjectOut(BaseModel):
     complexity_tier: str | None = None
     intake_status: str = "awaiting_data"
     intake_detail: str | None = None
+    mode: str = "managed"
 
     class Config:
         from_attributes = True

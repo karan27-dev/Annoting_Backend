@@ -47,6 +47,20 @@ class R2Client:
             ExpiresIn=expires,
         )
 
+    def put_fileobj(self, key: str, fileobj, content_type: str) -> bool:
+        """Server-side upload — streams a file object straight to R2. Used by
+        the backend-proxied upload path so the browser never has to satisfy R2
+        CORS. Returns False (no-op) when R2 isn't configured (dev)."""
+        if not self.configured:
+            return False
+        self._get_client().upload_fileobj(
+            fileobj,
+            settings.r2_bucket_name,
+            key,
+            ExtraArgs={"ContentType": content_type},
+        )
+        return True
+
     def presign_get(self, key: str, expires: int = 3600) -> str:
         if not self.configured:
             return f"https://r2.dev-stub.local/GET/{key}?expires={expires}"

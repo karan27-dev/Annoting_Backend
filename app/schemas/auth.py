@@ -15,6 +15,11 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class GoogleAuthRequest(BaseModel):
+    # The Google ID token (JWT) returned by Google Identity Services.
+    credential: str
+
+
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str

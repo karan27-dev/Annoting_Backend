@@ -7,19 +7,37 @@ canvas. It talks to CVAT only via its REST API.
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.database import AsyncSessionLocal
 from app.models.assignment import AssignmentStatus, TaskAssignment
 from app.models.common import utcnow
 from app.models.project import CvatMapping, Project
 from app.services.cvat_client import cvat
 from app.services.r2_client import r2
 
+logger = logging.getLogger("annoting.ingestion")
+
 
 class IngestionError(RuntimeError):
     pass
+
+
+async def run_ingestion_bg(project_id: str) -> None:
+    """Background wrapper: try to push an accepted project's data into CVAT and
+    mirror the real jobs. Best-effort — if CVAT/R2 aren't reachable the project
+    keeps its placeholder full-container job so annotators still see the work."""
+    async with AsyncSessionLocal() as db:
+        project = await db.get(Project, project_id)
+        if not project:
+            return
+        try:
+            await ingest_project(db, project)
+        except Exception as e:  # noqa: BLE001 — never crash the background task
+            logger.info("background ingestion for %s deferred: %s", project_id, e)
 
 
 async def ingest_project(db: AsyncSession, project: Project) -> dict:

@@ -4,6 +4,7 @@ from app.models.project import Project, CvatMapping
 from app.models.assignment import TaskAssignment, QualityReview
 from app.models.billing import ProjectQuote, Invoice
 from app.models.performance import AnnotatorPerformanceSnapshot
+from app.models.dataset import DatasetImage
 
 __all__ = [
     "User",
@@ -17,4 +18,5 @@ __all__ = [
     "ProjectQuote",
     "Invoice",
     "AnnotatorPerformanceSnapshot",
+    "DatasetImage",
 ]

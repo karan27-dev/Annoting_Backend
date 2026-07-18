@@ -35,6 +35,19 @@ class ProjectStatus(str, enum.Enum):
     archived = "archived"
 
 
+class ProjectMode(str, enum.Enum):
+    """How the data gets labeled.
+
+    self_serve — the owner labels their own images in the in-app editor and
+                 builds their dataset directly (Roboflow-style).
+    managed    — Annoting's annotators label it as a paid service (the quote →
+                 accept → annotate → review → deliver flow).
+    """
+
+    self_serve = "self_serve"
+    managed = "managed"
+
+
 class MediaType(str, enum.Enum):
     images = "images"
     videos = "videos"
@@ -75,6 +88,7 @@ class Project(Base):
     client_id: Mapped[str] = mapped_column(ForeignKey("clients.id"), index=True)
     name: Mapped[str] = mapped_column(String(255))
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mode: Mapped[str] = mapped_column(String(12), default=ProjectMode.managed.value)
     annotation_type: Mapped[str] = mapped_column(String(20))
     label_taxonomy: Mapped[list] = mapped_column(JSON, default=list)
     total_images: Mapped[int] = mapped_column(Integer, default=0)
