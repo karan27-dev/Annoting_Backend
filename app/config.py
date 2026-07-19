@@ -42,6 +42,13 @@ class Settings(BaseSettings):
     # clients share via "anyone with the link".
     google_api_key: str = ""
 
+    # ── Training bridge ───────────────────────────────────────────────────────
+    # Public base URL of THIS backend, embedded into the Colab training script
+    # so the notebook can call back with epoch metrics. localhost works only
+    # for local trainers; for real Colab use a tunnel (ngrok/cloudflared) or a
+    # deployed backend URL.
+    backend_public_url: str = "http://localhost:8000"
+
     # ── Google Sign-In (OAuth) ────────────────────────────────────────────────
     # OAuth 2.0 Web client ID from Google Cloud Console. The same value must be
     # exposed to the frontend as NEXT_PUBLIC_GOOGLE_CLIENT_ID. Enables the

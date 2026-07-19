@@ -17,6 +17,7 @@ from app.routers import (
     pricing,
     projects,
     reviewer,
+    training,
     uploads,
     webhooks,
 )
@@ -64,6 +65,7 @@ for r in (
     projects.router,
     uploads.router,
     datasets.router,
+    training.router,
     pricing.router,
     annotator.router,
     reviewer.router,

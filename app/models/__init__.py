@@ -5,8 +5,11 @@ from app.models.assignment import TaskAssignment, QualityReview
 from app.models.billing import ProjectQuote, Invoice
 from app.models.performance import AnnotatorPerformanceSnapshot
 from app.models.dataset import DatasetImage
+from app.models.training import DatasetVersion, TrainingJob
 
 __all__ = [
+    "DatasetVersion",
+    "TrainingJob",
     "User",
     "AnnotatorProfile",
     "Client",
