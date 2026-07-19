@@ -31,7 +31,7 @@ router = APIRouter(tags=["training"])
 ARCHITECTURES: dict[str, dict] = {
     "yolov8": {"label": "YOLOv8", "sizes": ["n", "s", "m", "l", "x"], "weights": "yolov8{size}.pt"},
     "yolo11": {"label": "YOLO11", "sizes": ["n", "s", "m", "l", "x"], "weights": "yolo11{size}.pt"},
-    "rfdetr": {"label": "RF-DETR", "sizes": ["l", "x"], "weights": "rtdetr-{size}.pt"},
+    "rfdetr": {"label": "RF-DETR", "sizes": ["n", "s", "m", "l", "x"], "weights": "rtdetr-{size}.pt"},
 }
 
 
@@ -349,7 +349,139 @@ async def trainer_script(
     arch = ARCHITECTURES.get(job.architecture, ARCHITECTURES["yolov8"])
     weights = arch["weights"].format(size=job.model_size)
     base = settings.backend_public_url.rstrip("/")
+    endpoint = base + "/v1/training/jobs/" + job.id
 
+    # ── RF-DETR: uses the `rfdetr` pip package + COCO format ─────────────────
+    if job.architecture == "rfdetr":
+        model_cls = "RFDETRBase" if job.model_size in ("n", "s", "m") else "RFDETRLarge"
+        return f'''# Annoting trainer — job {job.id} (RF-DETR)
+# Runs on Google Colab (Runtime -> Change runtime type -> GPU).
+import json, os, subprocess, sys, urllib.request
+from pathlib import Path
+
+BASE = {endpoint!r}
+TOKEN = {job.ingest_token!r}
+SIZE = {job.model_size!r}          # n/s/m → RFDETRBase  |  l/x → RFDETRLarge
+EPOCHS = {job.epochs_total}
+
+def post(payload, silent=False):
+    try:
+        req = urllib.request.Request(
+            BASE + "/events?token=" + TOKEN,
+            data=json.dumps(payload).encode(),
+            headers={{"Content-Type": "application/json"}},
+        )
+        urllib.request.urlopen(req, timeout=30).read()
+    except Exception:
+        if not silent: raise
+
+try:
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q",
+                    "rfdetr", "supervision", "Pillow"], check=True)
+    from rfdetr import RFDETRBase, RFDETRLarge
+    from PIL import Image
+
+    # 1) Pull dataset manifest from Annoting.
+    print("Downloading dataset...")
+    data = json.load(urllib.request.urlopen(BASE + "/data?token=" + TOKEN, timeout=300))
+    root = "/content/annoting_ds"
+    classes = data["classes"]
+    categories = [{{"id": i, "name": n, "supercategory": "object"}}
+                  for i, n in enumerate(classes)]
+
+    coco = {{sp: {{"images": [], "annotations": [], "categories": categories}}
+             for sp in ("train", "valid", "test")}}
+    counters = {{"train": 0, "valid": 0, "test": 0}}
+    ann_id = 1
+
+    for img_data in data["images"]:
+        split = img_data["split"]
+        os.makedirs(f"{{root}}/{{split}}", exist_ok=True)
+        img_path = f"{{root}}/{{split}}/{{img_data['filename']}}"
+        urllib.request.urlretrieve(img_data["url"], img_path)
+
+        with Image.open(img_path) as pil:
+            iw, ih = pil.size
+
+        counters[split] += 1
+        img_id = counters[split]
+        coco[split]["images"].append({{
+            "id": img_id, "file_name": img_data["filename"],
+            "width": iw, "height": ih,
+        }})
+        for line in img_data["labels"]:
+            parts = line.strip().split()
+            if len(parts) < 5: continue
+            cls_id = int(parts[0])
+            cx, cy, bw, bh = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            x = (cx - bw / 2) * iw
+            y = (cy - bh / 2) * ih
+            pw, ph = bw * iw, bh * ih
+            coco[split]["annotations"].append({{
+                "id": ann_id, "image_id": img_id, "category_id": cls_id,
+                "bbox": [x, y, pw, ph], "area": pw * ph, "iscrowd": 0,
+            }})
+            ann_id += 1
+
+    for split, coco_data in coco.items():
+        if coco_data["images"]:
+            with open(f"{{root}}/{{split}}/_annotations.coco.json", "w") as f:
+                json.dump(coco_data, f)
+    print("Dataset ready (COCO format).")
+
+    # 2) Create model — Base for nano/small/medium, Large for large/xlarge.
+    ModelCls = RFDETRBase if SIZE in ("n", "s", "m") else RFDETRLarge
+    model = ModelCls()
+    post({{"type": "started"}})
+    print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} · {{EPOCHS}} epochs")
+
+    # 3) Train and stream per-epoch metrics back to Annoting.
+    _last_log = {{}}
+    def on_epoch_end(log: dict):
+        _last_log.update(log)
+        post({{
+            "type": "epoch",
+            "epoch": int(log.get("epoch", 0)),
+            "metrics": {{
+                "map50":      float(log.get("map_50",    log.get("mAP_50",    log.get("map50",    0)))),
+                "train_loss": float(log.get("train_loss",log.get("loss",      0))),
+                "val_loss":   float(log.get("val_loss",  0)),
+                "precision":  float(log.get("precision", 0)),
+                "recall":     float(log.get("recall",    0)),
+            }},
+        }}, silent=True)
+
+    model.train(
+        dataset_dir=root,
+        epochs=EPOCHS,
+        batch_size=4,
+        grad_accum_steps=4,
+        output_dir="/content/rfdetr_output",
+        callbacks={{"on_fit_epoch_end": on_epoch_end}},
+    )
+
+    # 4) Post final results.
+    post({{
+        "type": "completed",
+        "results": {{
+            "map50":      float(_last_log.get("map_50",    _last_log.get("mAP_50",    _last_log.get("map50",    0)))),
+            "map50_95":   float(_last_log.get("map_50_95", 0)),
+            "precision":  float(_last_log.get("precision", 0)),
+            "recall":     float(_last_log.get("recall",    0)),
+            "f1":         0.0,
+            "per_class":  [],
+            "confusion_matrix": {{"labels": [*classes, "background"], "matrix": []}},
+            "confidence_curve": [],
+            "optimal_confidence": 0.5,
+        }},
+    }})
+    print("Training complete — results are live on your Annoting dashboard.")
+except Exception as e:
+    try: post({{"type": "failed", "error": str(e)[:500]}}, silent=True)
+    finally: raise
+'''
+
+    # ── YOLO (yolov8 / yolo11): Ultralytics path ──────────────────────────────
     return f'''# Annoting trainer — job {job.id}
 # Runs on Google Colab (Runtime -> Change runtime type -> GPU).
 import json, os, subprocess, sys, urllib.request
