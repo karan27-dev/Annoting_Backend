@@ -435,21 +435,34 @@ try:
     post({{"type": "started"}})
     print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} · {{EPOCHS}} epochs")
 
-    # 3) Train and stream per-epoch metrics back to Annoting.
+    # 3) Register callback BEFORE train() — rfdetr uses model.callbacks dict.
     _last_log = {{}}
+    _epoch_counter = [0]
+
     def on_epoch_end(log: dict):
         _last_log.update(log)
+        _epoch_counter[0] += 1
+        # rfdetr may use different key names across versions — try all known ones
+        def _f(keys, default=0.0):
+            for k in keys:
+                v = log.get(k)
+                if v is not None:
+                    try: return float(v)
+                    except: pass
+            return float(default)
         post({{
             "type": "epoch",
-            "epoch": int(log.get("epoch", 0)),
+            "epoch": _epoch_counter[0],
             "metrics": {{
-                "map50":      float(log.get("map_50",    log.get("mAP_50",    log.get("map50",    0)))),
-                "train_loss": float(log.get("train_loss",log.get("loss",      0))),
-                "val_loss":   float(log.get("val_loss",  0)),
-                "precision":  float(log.get("precision", 0)),
-                "recall":     float(log.get("recall",    0)),
+                "map50":      _f(["AP50", "map_50", "mAP_50", "map50", "val/map50"]),
+                "train_loss": _f(["train_loss", "loss", "train/loss"]),
+                "val_loss":   _f(["val_loss",   "val/loss"]),
+                "precision":  _f(["precision",  "val/precision"]),
+                "recall":     _f(["recall",     "val/recall"]),
             }},
         }}, silent=True)
+
+    model.callbacks["on_fit_epoch_end"].append(on_epoch_end)
 
     model.train(
         dataset_dir=root,
