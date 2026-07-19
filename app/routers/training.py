@@ -462,12 +462,12 @@ try:
     class _AnnCallback(pl.Callback):
         @staticmethod
         def _g(cm, *keys):
+            """Return the first matching metric value (including 0); 0.0 if none found."""
             for k in keys:
                 v = cm.get(k)
                 if v is not None:
                     try:
-                        val = float(v.item() if hasattr(v, "item") else v)
-                        if val > 0: return val
+                        return float(v.item() if hasattr(v, "item") else v)
                     except Exception: pass
             return 0.0
 
@@ -486,11 +486,27 @@ try:
                 if epoch in _seen_eps: return
                 _seen_eps.add(epoch)
                 cm = trainer.callback_metrics
+
+                # Dump all keys on first epoch so we can see exact metric names
+                if epoch == 1:
+                    print(f"[Annoting] Available metrics: {{sorted(cm.keys())}}")
+
                 m = {{
-                    "map50":      self._g(cm, "AP50","val/AP50","val_AP50","map_50","mAP_50","map50"),
-                    "map50_95":   self._g(cm, "AP","val/AP","val_AP","map_50_95"),
-                    "precision":  self._g(cm, "precision","Precision","val/precision","val_precision"),
-                    "recall":     self._g(cm, "recall","Recall","val/recall","val_recall"),
+                    "map50":      self._g(cm,
+                                    "AP50", "AP_50", "ap50", "ap_50",
+                                    "val/AP50", "val/AP_50", "val_AP50", "val_AP_50",
+                                    "map_50", "mAP_50", "map50", "mAP50",
+                                    "val/map50", "val_map50", "val/mAP50",
+                                    "mAP@50", "MAP@50"),
+                    "map50_95":   self._g(cm,
+                                    "AP", "AP_50_95", "ap50_95",
+                                    "val/AP", "val_AP", "map_50_95", "mAP_50_95"),
+                    "precision":  self._g(cm,
+                                    "precision", "Precision",
+                                    "val/precision", "val_precision"),
+                    "recall":     self._g(cm,
+                                    "recall", "Recall",
+                                    "val/recall", "val_recall"),
                     "train_loss": _train_loss[0],
                 }}
                 _collected.append((epoch, m))
@@ -502,6 +518,7 @@ try:
                     print(f"[Annoting] \u26a0 post failed epoch {{epoch}}: {{pe}}")
             except Exception:
                 import traceback; traceback.print_exc()
+
 
     _orig_pl_init = pl.Trainer.__init__
     def _patched_pl_init(self, *a, **kw):
