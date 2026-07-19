@@ -377,7 +377,7 @@ def post(payload, silent=False):
 
 try:
     subprocess.run([sys.executable, "-m", "pip", "install", "-q",
-                    "rfdetr", "supervision", "Pillow"], check=True)
+                    "rfdetr[train,loggers]", "supervision", "Pillow"], check=True)
     from rfdetr import RFDETRBase, RFDETRLarge
     from PIL import Image
 
