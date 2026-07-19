@@ -31,7 +31,7 @@ router = APIRouter(tags=["training"])
 ARCHITECTURES: dict[str, dict] = {
     "yolov8": {"label": "YOLOv8", "sizes": ["n", "s", "m", "l", "x"], "weights": "yolov8{size}.pt"},
     "yolo11": {"label": "YOLO11", "sizes": ["n", "s", "m", "l", "x"], "weights": "yolo11{size}.pt"},
-    "rtdetr": {"label": "RT-DETR", "sizes": ["l", "x"], "weights": "rtdetr-{size}.pt"},
+    "rfdetr": {"label": "RF-DETR", "sizes": ["l", "x"], "weights": "rtdetr-{size}.pt"},
 }
 
 
