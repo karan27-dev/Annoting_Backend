@@ -449,142 +449,94 @@ try:
                 json.dump(coco_data, f)
     print("Dataset ready (COCO format).")
 
-    # 2) Create model — Base for nano/small/medium, Large for large/xlarge.
-    ModelCls = RFDETRBase if SIZE in ("n", "s", "m") else RFDETRLarge
-    model = ModelCls()
-    post({{"type": "started"}})
-    print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} · {{EPOCHS}} epochs")
+    # ── 2) Monkey-patch PL Trainer to inject our metrics callback ───────────
+    #       rfdetr always uses pl.Trainer internally, so this fires every epoch
+    #       regardless of how Rich/IPython routes display output in Colab.
+    import pytorch_lightning as pl
 
-    # 3) Intercept rfdetr's stdout to parse epoch tables in real-time.
-    #    rfdetr prints Rich tables like:
-    #      "Val (Epoch 27/50) — Overall Metrics"
-    #      "│ 0.1683 │ 0.5427 │ ... │"  (7 numeric columns)
-    import re, threading
-
-    _collected  = []          # (epoch, metrics) — for batch fallback
-    _per_class  = []          # last per-class metrics for final results
+    _collected  = []
+    _per_class  = []
     _seen_eps   = set()
-
-    _EPOCH_RE  = re.compile(r'Val \(Epoch (\d+)/\d+\)')
-    _METRIC_RE = re.compile(
-        r'│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
-        r'\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
-    )
-    # Per-class row: │ classname │ 0.1683 │ 0.3880 │ 0.6923 │ 0.6667 │ 0.7200 │
-    _CLASS_RE  = re.compile(
-        r'│\s*(\w[\w ]*?)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
-    )
-    # Loss from tqdm: train_loss_epoch=2.87
-    _LOSS_RE   = re.compile(r'train_loss(?:_epoch)?=([\d.]+)')
-
     _train_loss = [0.0]
 
-    def _on_epoch(ep, vals):
-        """vals = [map5095, map50, map75, mar, f1, prec, recall]"""
-        if ep in _seen_eps:
-            return
-        _seen_eps.add(ep)
-        m = {{
-            "map50":      vals[1],
-            "map50_95":   vals[0],
-            "precision":  vals[5],
-            "recall":     vals[6],
-            "train_loss": _train_loss[0],
-        }}
-        _collected.append((ep, m))
-        try:
-            post({{"type": "epoch", "epoch": ep, "metrics": m}})
-            print(f"[Annoting] ✓ Epoch {{ep}}/{{EPOCHS}} → mAP50={{vals[1]:.3f}} P={{vals[5]:.3f}} R={{vals[6]:.3f}}")
-        except Exception as pe:
-            print(f"[Annoting] ⚠ Epoch {{ep}} post failed: {{pe}}")
-
-    class _Tee:
-        def __init__(self, orig):
-            self._o  = orig
-            self._b  = ""
-            self._lk = threading.Lock()
-        def write(self, s):
-            self._o.write(s)
-            with self._lk:
-                # Capture train_loss from tqdm bar
-                lm = _LOSS_RE.search(s)
-                if lm:
-                    try: _train_loss[0] = float(lm.group(1))
+    class _AnnCallback(pl.Callback):
+        @staticmethod
+        def _g(cm, *keys):
+            for k in keys:
+                v = cm.get(k)
+                if v is not None:
+                    try:
+                        val = float(v.item() if hasattr(v, "item") else v)
+                        if val > 0: return val
                     except Exception: pass
-                # Accumulate for table parsing (keep last 4 KB)
-                self._b = (self._b + s)[-4096:]
-                em = _EPOCH_RE.search(self._b)
-                rm = _METRIC_RE.search(self._b)
-                if em and rm:
-                    ep  = int(em.group(1))
-                    vs  = [float(x) for x in rm.groups()]
-                    # Parse per-class rows that appear just after Overall table
-                    cms = _CLASS_RE.findall(self._b)
-                    if cms:
-                        _per_class.clear()
-                        for cls_name, ap5095, ar, f1, prec, rec in cms:
-                            _per_class.append({{
-                                "name":  cls_name.strip(),
-                                "map50": float(ap5095),
-                            }})
-                    self._b = ""
-                    _on_epoch(ep, vs)
-        def flush(self): self._o.flush()
-        def __getattr__(self, a): return getattr(self._o, a)
+            return 0.0
 
-    _orig = sys.stdout
-    sys.stdout = _Tee(_orig)
+        def on_train_epoch_end(self, trainer, pl_module):
+            try:
+                cm = trainer.callback_metrics
+                loss = self._g(cm,
+                    "train_loss_epoch", "train/loss_epoch",
+                    "train_loss",       "train/loss",  "loss")
+                if loss: _train_loss[0] = loss
+            except Exception: pass
 
-    # 4) Also register model.callbacks as a secondary path (best-effort).
-    def _cb_epoch(log: dict):
-        try:
-            ep = next((int(float(log[k])) for k in ("epoch","Epoch") if k in log), None)
-            if ep is None or ep in _seen_eps:
-                return
-            _seen_eps.add(ep)
-            def _g(*keys):
-                for k in keys:
-                    v = log.get(k)
-                    if v is not None:
-                        try: return float(v)
-                        except Exception: pass
-                return 0.0
-            m = {{
-                "map50":      _g("AP50","map_50","mAP_50","map50"),
-                "precision":  _g("precision","Precision"),
-                "recall":     _g("recall","Recall"),
-                "train_loss": _train_loss[0],
-            }}
-            _collected.append((ep, m))
-            post({{"type": "epoch", "epoch": ep, "metrics": m}})
-        except Exception:
-            pass
-    try:
-        model.callbacks["on_fit_epoch_end"].append(_cb_epoch)
-    except Exception:
-        pass
+        def on_validation_epoch_end(self, trainer, pl_module):
+            try:
+                epoch = trainer.current_epoch + 1
+                if epoch in _seen_eps: return
+                _seen_eps.add(epoch)
+                cm = trainer.callback_metrics
+                m = {{
+                    "map50":      self._g(cm, "AP50","val/AP50","val_AP50","map_50","mAP_50","map50"),
+                    "map50_95":   self._g(cm, "AP","val/AP","val_AP","map_50_95"),
+                    "precision":  self._g(cm, "precision","Precision","val/precision","val_precision"),
+                    "recall":     self._g(cm, "recall","Recall","val/recall","val_recall"),
+                    "train_loss": _train_loss[0],
+                }}
+                _collected.append((epoch, m))
+                try:
+                    post({{\"type\": \"epoch\", \"epoch\": epoch, \"metrics\": m}})
+                    print(f"[Annoting] \u2713 {{epoch}}/{{EPOCHS}}  "
+                          f"mAP50={{m['map50']:.4f}}  P={{m['precision']:.4f}}  R={{m['recall']:.4f}}")
+                except Exception as pe:
+                    print(f"[Annoting] \u26a0 post failed epoch {{epoch}}: {{pe}}")
+            except Exception:
+                import traceback; traceback.print_exc()
 
-    try:
-        model.train(
-            dataset_dir=root,
-            epochs=EPOCHS,
-            batch_size=4,
-            grad_accum_steps=4,
-            output_dir="/content/rfdetr_output",
-        )
-    finally:
-        sys.stdout = _orig   # always restore stdout
+    _orig_pl_init = pl.Trainer.__init__
+    def _patched_pl_init(self, *a, **kw):
+        cbs = list(kw.get("callbacks") or [])
+        cbs.append(_AnnCallback())
+        kw["callbacks"] = cbs
+        _orig_pl_init(self, *a, **kw)
+    pl.Trainer.__init__ = _patched_pl_init
+    print("[Annoting] Lightning Trainer patched — metrics will stream live.")
 
-    # 5) Batch-post any epochs not yet streamed.
+    # ── 3) Create model and train ────────────────────────────────────────────
+    ModelCls = RFDETRBase if SIZE in ("n", "s", "m") else RFDETRLarge
+    model = ModelCls()
+    post({{\"type\": \"started\"}})
+    print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} \u00b7 {{EPOCHS}} epochs")
+
+    model.train(
+        dataset_dir=root,
+        epochs=EPOCHS,
+        batch_size=4,
+        grad_accum_steps=4,
+        output_dir="/content/rfdetr_output",
+    )
+    pl.Trainer.__init__ = _orig_pl_init   # restore
+
+    # ── 4) Batch-post any epochs not yet sent live (safety net) ─────────────
     posted = set()
     for ep, m in _collected:
         if ep not in posted:
             posted.add(ep)
-            try: post({{"type": "epoch", "epoch": ep, "metrics": m}})
+            try: post({{\"type\": \"epoch\", \"epoch\": ep, \"metrics\": m}})
             except Exception: pass
-    print(f"[Annoting] Done — {{len(posted)}} epoch(s) reported.")
+    print(f"[Annoting] Done \u2014 {{len(posted)}} epoch(s) reported.")
 
-    # 6) Final completed event.
+    # ── 5) Completed event ───────────────────────────────────────────────────
     last_m = _collected[-1][1] if _collected else {{}}
     post({{
         "type": "completed",
@@ -595,14 +547,14 @@ try:
             "recall":    last_m.get("recall",    0.0),
             "f1":        0.0,
             "per_class": _per_class,
-            "confusion_matrix": {{"labels": [*classes, "background"], "matrix": []}},
+            "confusion_matrix": {{\"labels\": [*classes, "background"], \"matrix\": []}},
             "confidence_curve": [],
             "optimal_confidence": 0.5,
         }},
     }})
-    print("Training complete — results are live on your Annoting dashboard.")
+    print("Training complete \u2014 results are live on your Annoting dashboard.")
 except Exception as e:
-    try: post({{"type": "failed", "error": str(e)[:500]}}, silent=True)
+    try: post({{\"type\": \"failed\", \"error\": str(e)[:500]}}, silent=True)
     finally: raise
 '''
 
