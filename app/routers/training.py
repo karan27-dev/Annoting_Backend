@@ -455,73 +455,146 @@ try:
     post({{"type": "started"}})
     print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} · {{EPOCHS}} epochs")
 
-    # 3) Register callback BEFORE train() — rfdetr appends to model.callbacks.
-    _collected = []   # accumulates (epoch, metrics) for fallback batch-post
-    _epoch_counter = [0]
+    # 3) Intercept rfdetr's stdout to parse epoch tables in real-time.
+    #    rfdetr prints Rich tables like:
+    #      "Val (Epoch 27/50) — Overall Metrics"
+    #      "│ 0.1683 │ 0.5427 │ ... │"  (7 numeric columns)
+    import re, threading
 
-    def _f(d, keys, default=0.0):
-        """Try multiple metric key names — rfdetr key names vary by version."""
-        for k in keys:
-            v = d.get(k)
-            if v is not None:
-                try: return float(v)
-                except Exception: pass
-        return float(default)
+    _collected  = []          # (epoch, metrics) — for batch fallback
+    _per_class  = []          # last per-class metrics for final results
+    _seen_eps   = set()
 
-    def on_epoch_end(log: dict):
+    _EPOCH_RE  = re.compile(r'Val \(Epoch (\d+)/\d+\)')
+    _METRIC_RE = re.compile(
+        r'│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
+        r'\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
+    )
+    # Per-class row: │ classname │ 0.1683 │ 0.3880 │ 0.6923 │ 0.6667 │ 0.7200 │
+    _CLASS_RE  = re.compile(
+        r'│\s*(\w[\w ]*?)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│\s*([\d.]+)\s*│'
+    )
+    # Loss from tqdm: train_loss_epoch=2.87
+    _LOSS_RE   = re.compile(r'train_loss(?:_epoch)?=([\d.]+)')
+
+    _train_loss = [0.0]
+
+    def _on_epoch(ep, vals):
+        """vals = [map5095, map50, map75, mar, f1, prec, recall]"""
+        if ep in _seen_eps:
+            return
+        _seen_eps.add(ep)
+        m = {{
+            "map50":      vals[1],
+            "map50_95":   vals[0],
+            "precision":  vals[5],
+            "recall":     vals[6],
+            "train_loss": _train_loss[0],
+        }}
+        _collected.append((ep, m))
         try:
-            _epoch_counter[0] += 1
-            ep = _epoch_counter[0]
+            post({{"type": "epoch", "epoch": ep, "metrics": m}})
+            print(f"[Annoting] ✓ Epoch {{ep}}/{{EPOCHS}} → mAP50={{vals[1]:.3f}} P={{vals[5]:.3f}} R={{vals[6]:.3f}}")
+        except Exception as pe:
+            print(f"[Annoting] ⚠ Epoch {{ep}} post failed: {{pe}}")
+
+    class _Tee:
+        def __init__(self, orig):
+            self._o  = orig
+            self._b  = ""
+            self._lk = threading.Lock()
+        def write(self, s):
+            self._o.write(s)
+            with self._lk:
+                # Capture train_loss from tqdm bar
+                lm = _LOSS_RE.search(s)
+                if lm:
+                    try: _train_loss[0] = float(lm.group(1))
+                    except Exception: pass
+                # Accumulate for table parsing (keep last 4 KB)
+                self._b = (self._b + s)[-4096:]
+                em = _EPOCH_RE.search(self._b)
+                rm = _METRIC_RE.search(self._b)
+                if em and rm:
+                    ep  = int(em.group(1))
+                    vs  = [float(x) for x in rm.groups()]
+                    # Parse per-class rows that appear just after Overall table
+                    cms = _CLASS_RE.findall(self._b)
+                    if cms:
+                        _per_class.clear()
+                        for cls_name, ap5095, ar, f1, prec, rec in cms:
+                            _per_class.append({{
+                                "name":  cls_name.strip(),
+                                "map50": float(ap5095),
+                            }})
+                    self._b = ""
+                    _on_epoch(ep, vs)
+        def flush(self): self._o.flush()
+        def __getattr__(self, a): return getattr(self._o, a)
+
+    _orig = sys.stdout
+    sys.stdout = _Tee(_orig)
+
+    # 4) Also register model.callbacks as a secondary path (best-effort).
+    def _cb_epoch(log: dict):
+        try:
+            ep = next((int(float(log[k])) for k in ("epoch","Epoch") if k in log), None)
+            if ep is None or ep in _seen_eps:
+                return
+            _seen_eps.add(ep)
+            def _g(*keys):
+                for k in keys:
+                    v = log.get(k)
+                    if v is not None:
+                        try: return float(v)
+                        except Exception: pass
+                return 0.0
             m = {{
-                "map50":      _f(log, ["AP50", "map_50", "mAP_50", "map50", "val/map50"]),
-                "train_loss": _f(log, ["train_loss", "loss", "train/loss"]),
-                "val_loss":   _f(log, ["val_loss", "val/loss"]),
-                "precision":  _f(log, ["precision", "val/precision"]),
-                "recall":     _f(log, ["recall", "val/recall"]),
+                "map50":      _g("AP50","map_50","mAP_50","map50"),
+                "precision":  _g("precision","Precision"),
+                "recall":     _g("recall","Recall"),
+                "train_loss": _train_loss[0],
             }}
             _collected.append((ep, m))
-            try:
-                post({{"type": "epoch", "epoch": ep, "metrics": m}})
-                print(f"[Annoting] ✓ Epoch {{ep}} posted (mAP50={{m['map50']:.3f}})")
-            except Exception as pe:
-                print(f"[Annoting] ⚠ Epoch {{ep}} post failed: {{pe}} — will batch-post at end")
-        except Exception as ce:
-            print(f"[Annoting] ⚠ Callback error epoch {{_epoch_counter[0]}}: {{ce}}")
+            post({{"type": "epoch", "epoch": ep, "metrics": m}})
+        except Exception:
+            pass
+    try:
+        model.callbacks["on_fit_epoch_end"].append(_cb_epoch)
+    except Exception:
+        pass
 
     try:
-        model.callbacks["on_fit_epoch_end"].append(on_epoch_end)
-        print("[Annoting] Epoch callback registered.")
-    except Exception as e:
-        print(f"[Annoting] ⚠ Could not register callback: {{e}}")
+        model.train(
+            dataset_dir=root,
+            epochs=EPOCHS,
+            batch_size=4,
+            grad_accum_steps=4,
+            output_dir="/content/rfdetr_output",
+        )
+    finally:
+        sys.stdout = _orig   # always restore stdout
 
-    model.train(
-        dataset_dir=root,
-        epochs=EPOCHS,
-        batch_size=4,
-        grad_accum_steps=4,
-        output_dir="/content/rfdetr_output",
-    )
+    # 5) Batch-post any epochs not yet streamed.
+    posted = set()
+    for ep, m in _collected:
+        if ep not in posted:
+            posted.add(ep)
+            try: post({{"type": "epoch", "epoch": ep, "metrics": m}})
+            except Exception: pass
+    print(f"[Annoting] Done — {{len(posted)}} epoch(s) reported.")
 
-    # 4) Batch-post any epochs that weren't streamed live (fallback).
-    if _collected:
-        print(f"[Annoting] Batch-posting {{len(_collected)}} epoch(s) that weren't streamed live...")
-        for ep, m in _collected:
-            try:
-                post({{"type": "epoch", "epoch": ep, "metrics": m}})
-            except Exception:
-                pass
-
-    # 5) Post final results using last collected metrics.
+    # 6) Final completed event.
     last_m = _collected[-1][1] if _collected else {{}}
     post({{
         "type": "completed",
         "results": {{
-            "map50":      last_m.get("map50", 0.0),
-            "map50_95":   0.0,
-            "precision":  last_m.get("precision", 0.0),
-            "recall":     last_m.get("recall", 0.0),
-            "f1":         0.0,
-            "per_class":  [],
+            "map50":     last_m.get("map50",     0.0),
+            "map50_95":  last_m.get("map50_95",  0.0),
+            "precision": last_m.get("precision", 0.0),
+            "recall":    last_m.get("recall",    0.0),
+            "f1":        0.0,
+            "per_class": _per_class,
             "confusion_matrix": {{"labels": [*classes, "background"], "matrix": []}},
             "confidence_curve": [],
             "optimal_confidence": 0.5,
