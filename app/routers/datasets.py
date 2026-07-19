@@ -249,6 +249,7 @@ async def image_detail(
         height=img.height,
         status=img.status,
         split=img.split,
+        annotation_type=project.annotation_type,
         annotations=[Shape(**s) for s in (img.annotations or [])],
         labels=_label_defs(project),
         index=idx,
@@ -340,32 +341,49 @@ async def export_dataset(
                 }
             )
             for sh in img.annotations or []:
-                w = sh["w"] * img.width
-                h = sh["h"] * img.height
-                x = sh["x"] * img.width
-                y = sh["y"] * img.height
-                coco["annotations"].append(
-                    {
-                        "id": ann_id,
-                        "image_id": img.order_index,
-                        "category_id": label_index.get(sh["label"], 0),
-                        "bbox": [round(x, 1), round(y, 1), round(w, 1), round(h, 1)],
-                        "area": round(w * h, 1),
-                        "iscrowd": 0,
-                    }
-                )
+                w = sh.get("w", 1.0) * img.width
+                h = sh.get("h", 1.0) * img.height
+                x = sh.get("x", 0.0) * img.width
+                y = sh.get("y", 0.0) * img.height
+                ann = {
+                    "id": ann_id,
+                    "image_id": img.order_index,
+                    "category_id": label_index.get(sh["label"], 0),
+                    "bbox": [round(x, 1), round(y, 1), round(w, 1), round(h, 1)],
+                    "area": round(w * h, 1),
+                    "iscrowd": 0,
+                }
+                if sh.get("points"):
+                    # COCO segmentation: flat [x1,y1,x2,y2,…] in pixels.
+                    ann["segmentation"] = [
+                        [
+                            round(c, 1)
+                            for px, py in sh["points"]
+                            for c in (px * img.width, py * img.height)
+                        ]
+                    ]
+                coco["annotations"].append(ann)
                 ann_id += 1
         return coco
 
-    # YOLO: per-image "class cx cy w h" (already normalized centre form)
+    # YOLO: per-image "class cx cy w h" for boxes, or YOLO-seg
+    # "class x1 y1 x2 y2 …" when the shape carries polygon points.
     out: dict[str, str] = {}
     for img in images:
         lines = []
         for sh in img.annotations or []:
             cls = label_index.get(sh["label"], 0)
-            cx = sh["x"] + sh["w"] / 2
-            cy = sh["y"] + sh["h"] / 2
-            lines.append(f"{cls} {cx:.6f} {cy:.6f} {sh['w']:.6f} {sh['h']:.6f}")
+            if sh.get("points"):
+                coords = " ".join(
+                    f"{px:.6f} {py:.6f}" for px, py in sh["points"]
+                )
+                lines.append(f"{cls} {coords}")
+                continue
+            x, y = sh.get("x", 0.0), sh.get("y", 0.0)
+            w, h = sh.get("w", 1.0), sh.get("h", 1.0)
+            cx = x + w / 2
+            cy = y + h / 2
+            lines.append(f"{cls} {cx:.6f} {cy:.6f} {w:.6f} {h:.6f}")
         stem = img.filename.rsplit(".", 1)[0]
         out[f"{stem}.txt"] = "\n".join(lines)
     return {

@@ -4,13 +4,21 @@ from pydantic import BaseModel, Field
 
 
 class Shape(BaseModel):
-    """One normalized bounding box (fractions of image w/h, 0..1)."""
+    """One annotation, all coords normalized to fractions of image w/h (0..1).
+
+    type "bbox"           — x/y/w/h is the box.
+    type "polygon"        — points is the vertex list; x/y/w/h is the enclosing
+                            box (kept in sync so bbox consumers keep working).
+    type "classification" — whole-image label; x/y/w/h is 0,0,1,1.
+    """
 
     label: str
-    x: float
-    y: float
-    w: float
-    h: float
+    x: float = 0.0
+    y: float = 0.0
+    w: float = 1.0
+    h: float = 1.0
+    type: str = "bbox"
+    points: list[list[float]] | None = None
 
 
 class AnnotationsSave(BaseModel):
@@ -37,6 +45,7 @@ class ImageDetail(BaseModel):
     height: int
     status: str
     split: str
+    annotation_type: str = "bbox"
     annotations: list[Shape]
     labels: list[dict]
     index: int
