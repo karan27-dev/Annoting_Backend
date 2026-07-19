@@ -218,6 +218,26 @@ async def get_job(
     return _job_out(job, include_token=True)
 
 
+@router.post("/training/jobs/{job_id}/cancel")
+async def cancel_job(
+    job_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Owner can cancel a stuck awaiting_gpu or running job."""
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _owned_project(job.project_id, user, db)
+    if job.status in (TrainingStatus.completed.value, TrainingStatus.failed.value):
+        raise HTTPException(status_code=400, detail="Job already finished")
+    job.status = TrainingStatus.failed.value
+    job.error = "Cancelled by user"
+    job.completed_at = utcnow()
+    await db.commit()
+    return {"ok": True}
+
+
 @router.get("/datasets/{project_id}/models")
 async def list_models(
     project_id: str,
@@ -435,34 +455,44 @@ try:
     post({{"type": "started"}})
     print(f"Training RF-DETR {{'Base' if SIZE in ('n','s','m') else 'Large'}} · {{EPOCHS}} epochs")
 
-    # 3) Register callback BEFORE train() — rfdetr uses model.callbacks dict.
-    _last_log = {{}}
+    # 3) Register callback BEFORE train() — rfdetr appends to model.callbacks.
+    _collected = []   # accumulates (epoch, metrics) for fallback batch-post
     _epoch_counter = [0]
 
-    def on_epoch_end(log: dict):
-        _last_log.update(log)
-        _epoch_counter[0] += 1
-        # rfdetr may use different key names across versions — try all known ones
-        def _f(keys, default=0.0):
-            for k in keys:
-                v = log.get(k)
-                if v is not None:
-                    try: return float(v)
-                    except: pass
-            return float(default)
-        post({{
-            "type": "epoch",
-            "epoch": _epoch_counter[0],
-            "metrics": {{
-                "map50":      _f(["AP50", "map_50", "mAP_50", "map50", "val/map50"]),
-                "train_loss": _f(["train_loss", "loss", "train/loss"]),
-                "val_loss":   _f(["val_loss",   "val/loss"]),
-                "precision":  _f(["precision",  "val/precision"]),
-                "recall":     _f(["recall",     "val/recall"]),
-            }},
-        }}, silent=True)
+    def _f(d, keys, default=0.0):
+        """Try multiple metric key names — rfdetr key names vary by version."""
+        for k in keys:
+            v = d.get(k)
+            if v is not None:
+                try: return float(v)
+                except Exception: pass
+        return float(default)
 
-    model.callbacks["on_fit_epoch_end"].append(on_epoch_end)
+    def on_epoch_end(log: dict):
+        try:
+            _epoch_counter[0] += 1
+            ep = _epoch_counter[0]
+            m = {{
+                "map50":      _f(log, ["AP50", "map_50", "mAP_50", "map50", "val/map50"]),
+                "train_loss": _f(log, ["train_loss", "loss", "train/loss"]),
+                "val_loss":   _f(log, ["val_loss", "val/loss"]),
+                "precision":  _f(log, ["precision", "val/precision"]),
+                "recall":     _f(log, ["recall", "val/recall"]),
+            }}
+            _collected.append((ep, m))
+            try:
+                post({{"type": "epoch", "epoch": ep, "metrics": m}})
+                print(f"[Annoting] ✓ Epoch {{ep}} posted (mAP50={{m['map50']:.3f}})")
+            except Exception as pe:
+                print(f"[Annoting] ⚠ Epoch {{ep}} post failed: {{pe}} — will batch-post at end")
+        except Exception as ce:
+            print(f"[Annoting] ⚠ Callback error epoch {{_epoch_counter[0]}}: {{ce}}")
+
+    try:
+        model.callbacks["on_fit_epoch_end"].append(on_epoch_end)
+        print("[Annoting] Epoch callback registered.")
+    except Exception as e:
+        print(f"[Annoting] ⚠ Could not register callback: {{e}}")
 
     model.train(
         dataset_dir=root,
@@ -470,17 +500,26 @@ try:
         batch_size=4,
         grad_accum_steps=4,
         output_dir="/content/rfdetr_output",
-        callbacks={{"on_fit_epoch_end": on_epoch_end}},
     )
 
-    # 4) Post final results.
+    # 4) Batch-post any epochs that weren't streamed live (fallback).
+    if _collected:
+        print(f"[Annoting] Batch-posting {{len(_collected)}} epoch(s) that weren't streamed live...")
+        for ep, m in _collected:
+            try:
+                post({{"type": "epoch", "epoch": ep, "metrics": m}})
+            except Exception:
+                pass
+
+    # 5) Post final results using last collected metrics.
+    last_m = _collected[-1][1] if _collected else {{}}
     post({{
         "type": "completed",
         "results": {{
-            "map50":      float(_last_log.get("map_50",    _last_log.get("mAP_50",    _last_log.get("map50",    0)))),
-            "map50_95":   float(_last_log.get("map_50_95", 0)),
-            "precision":  float(_last_log.get("precision", 0)),
-            "recall":     float(_last_log.get("recall",    0)),
+            "map50":      last_m.get("map50", 0.0),
+            "map50_95":   0.0,
+            "precision":  last_m.get("precision", 0.0),
+            "recall":     last_m.get("recall", 0.0),
             "f1":         0.0,
             "per_class":  [],
             "confusion_matrix": {{"labels": [*classes, "background"], "matrix": []}},
