@@ -55,6 +55,9 @@ class TrainingJob(Base):
     architecture: Mapped[str] = mapped_column(String(30))   # yolov8 | yolo11 | rtdetr
     model_size: Mapped[str] = mapped_column(String(10))     # n | s | m …
     epochs_total: Mapped[int] = mapped_column(Integer, default=25)
+    # Video deployment: which multi-object tracker the trained detector runs
+    # with (Ultralytics model.track). "none" = image-only, no tracking.
+    tracker: Mapped[str] = mapped_column(String(12), default="none")
     status: Mapped[str] = mapped_column(
         String(15), default=TrainingStatus.awaiting_gpu.value, index=True
     )

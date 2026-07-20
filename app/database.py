@@ -63,6 +63,8 @@ _ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
     # Admin-reviewed quotes: drafts until published.
     ("project_quotes", "published_at", "TIMESTAMP"),
     ("project_quotes", "admin_notes", "VARCHAR(500)"),
+    # Video deployment: multi-object tracker paired with a trained detector.
+    ("training_jobs", "tracker", "VARCHAR(12) DEFAULT 'none'"),
 ]
 
 

@@ -58,6 +58,7 @@ def _job_out(job: TrainingJob, include_token: bool = False) -> dict:
         "architecture": job.architecture,
         "model_size": job.model_size,
         "epochs_total": job.epochs_total,
+        "tracker": getattr(job, "tracker", "none") or "none",
         "status": job.status,
         "current_epoch": job.current_epoch,
         "metrics": job.metrics or [],
@@ -174,6 +175,12 @@ class TrainStart(BaseModel):
     architecture: str = "yolov8"
     model_size: str = "n"
     epochs: int = Field(default=25, ge=1, le=300)
+    # "none" | "bytetrack" | "botsort" — pairs a tracker with the detector so
+    # the trained model runs on video via Ultralytics model.track().
+    tracker: str = "none"
+
+
+TRACKERS = {"none", "bytetrack", "botsort"}
 
 
 @router.post("/datasets/{project_id}/train")
@@ -188,6 +195,8 @@ async def start_training(
         raise HTTPException(status_code=400, detail="Unknown architecture")
     if body.model_size not in ARCHITECTURES[body.architecture]["sizes"]:
         raise HTTPException(status_code=400, detail="Unknown model size")
+    if body.tracker not in TRACKERS:
+        raise HTTPException(status_code=400, detail="Unknown tracker")
     version = await db.get(DatasetVersion, body.version_id)
     if not version or version.project_id != project.id:
         raise HTTPException(status_code=404, detail="Dataset version not found")
@@ -198,6 +207,7 @@ async def start_training(
         architecture=body.architecture,
         model_size=body.model_size,
         epochs_total=body.epochs,
+        tracker=body.tracker,
     )
     db.add(job)
     await db.commit()
@@ -576,6 +586,28 @@ except Exception as e:
 '''
 
     # ── YOLO (yolov8 / yolo11): Ultralytics path ──────────────────────────────
+    # Optional video-deployment cell: pair the trained detector with a
+    # multi-object tracker so it runs on video via Ultralytics model.track().
+    if job.tracker in ("none", "", None):
+        tracker_cell = ""
+    else:
+        tname = "ByteTrack" if job.tracker == "bytetrack" else "BoT-SORT"
+        tyaml = "bytetrack.yaml" if job.tracker == "bytetrack" else "botsort.yaml"
+        tracker_cell = f'''
+    # 4) Video deployment — track objects across frames with {tname}.
+    _best = str(getattr(getattr(model, "trainer", None), "best", "") or {weights!r})
+    with open("/content/track_video.py", "w") as _f:
+        _f.write(
+            ("import sys\\n"
+             "from ultralytics import YOLO\\n"
+             "model = YOLO(%r)\\n" % _best) +
+            "for r in model.track(source=sys.argv[1], tracker={tyaml!r}, persist=True, stream=True):\\n"
+            "    ids = r.boxes.id.int().tolist() if (r.boxes is not None and r.boxes.id is not None) else []\\n"
+            "    print(r.path, ids)\\n"
+        )
+    print("[Annoting] Saved /content/track_video.py — run: python track_video.py your_video.mp4")
+'''
+
     return f'''# Annoting trainer — job {job.id}
 # Runs on Google Colab (Runtime -> Change runtime type -> GPU).
 import json, os, subprocess, sys, urllib.request
@@ -683,6 +715,7 @@ try:
             "optimal_confidence": optimal,
         }},
     }})
+{tracker_cell}
     print("Training complete — results are live on your Annoting dashboard.")
 except Exception as e:
     try:
